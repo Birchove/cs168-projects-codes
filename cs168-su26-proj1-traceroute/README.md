@@ -243,6 +243,78 @@ D5 3E 82 9A 00 0E 94 40
 
 代码已实现. 详情见注释. 运行codes时, 请关闭TUN或虚拟网卡.
 
+实现代码(1A):
+```python
+def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
+        -> list[list[str]]:
+
+    result = []
+    reached = False
+
+    for ttl in range(1, TRACEROUTE_MAX_TTL + 1):
+        routers_this_ttl = []
+
+        # 多次尝试
+        for _ in range(PROBE_ATTEMPT_COUNT):
+            #   send
+            sendsock.set_ttl(ttl)
+            sendsock.sendto("Potato".encode(), (ip, TRACEROUTE_PORT_NUMBER))
+
+            # 判断有无返回信号
+            if not recvsock.recv_select():
+                continue
+
+            # 得到对应返回的字节串
+            buf, _ = recvsock.recvfrom()
+
+            # 长度不足IPv4首部最短长度, 可能是截断包或异常短包，直接 IPv4(buf) 会越报错，直接丢弃并继续下一轮尝试。
+            if len(buf) < 20:
+                continue
+
+            # 得到外部 IPv4 字段
+            outer_ip = IPv4(buf)
+            icmp_offset = outer_ip.header_len       # icmp 偏移量, 对应于IPv4header长度
+
+            # 外层 IPv4 的上层协议不是 ICMP（协议号不为 1），
+            # 或者剩余字节数不足以容纳一个完整的 8 字节 ICMP 首部 + 20 字节 内部IPv4 协议
+            if outer_ip.proto != 1 or len(buf) < icmp_offset + 8 + 20:
+                continue
+
+            icmp = ICMP(buf[icmp_offset:])
+
+            inner_ip_offset = icmp_offset + 8       # 固定长度, icmp偏移量 + 8
+            inner_ip = IPv4(buf[inner_ip_offset:])
+
+            inner_udp_offset = inner_ip_offset + inner_ip.header_len
+
+            # 检查协议, 以及字节串长度, 协议为 17 代表内嵌协议为UDP
+            if inner_ip.proto != 17 or len(buf) < inner_ip_offset + 8:
+                continue
+
+            inner_udp = UDP(buf[inner_udp_offset:])
+
+            # 确认这条 ICMP 报错是由我们发往目标 IP / 探测端口的 UDP 包触发的
+            if inner_ip.dst != ip or inner_udp.dst_port != TRACEROUTE_PORT_NUMBER:
+                continue
+
+            # Type 11 (Time Exceeded) 表示途经路由器；Type 3, Code 3 (Port Unreachable) 表示到达目标主机
+            # 这是 UDP 常用的判定组合, 其余type不是 traceroute 探测期待的响应
+            if icmp.type == 11 and icmp.code == 0:
+                if outer_ip.src not in routers_this_ttl:
+                    routers_this_ttl.append(outer_ip.src)
+            elif icmp.type == 3 and icmp.code == 3:
+                if outer_ip.src not in routers_this_ttl:
+                    routers_this_ttl.append(outer_ip.src)
+                reached = True
+
+        util.print_result(routers_this_ttl, ttl)
+        result.append(routers_this_ttl)
+
+        if reached:
+            break
+    return result
+```
+
 本项目下的运行结果:
 ```zsh
 ❯ python3 traceroute.py cmu.edu
