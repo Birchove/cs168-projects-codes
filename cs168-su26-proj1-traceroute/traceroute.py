@@ -165,6 +165,9 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
     # TODO Add your implementation
     result = []
     reached = False
+    port_offset = 0     # 为每个ttl分配一个port, 防止不同的ttl因为延迟返回, 导致 traceroute 错误
+                        # 不能直接用回程外层ipv4的ttl判断, 因为去程和回程的路由可能不同.
+                        # 但规定端口后, 可从udp字段中唯一确定是哪次 ttl
 
     for ttl in range(1, TRACEROUTE_MAX_TTL + 1):
         routers_this_ttl = []
@@ -173,7 +176,7 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
         for _ in range(PROBE_ATTEMPT_COUNT):
             #   send
             sendsock.set_ttl(ttl)
-            sendsock.sendto("Potato".encode(), (ip, TRACEROUTE_PORT_NUMBER))
+            sendsock.sendto("Potato".encode(), (ip, TRACEROUTE_PORT_NUMBER + port_offset))
 
             # 判断有无返回信号
             if not recvsock.recv_select():
@@ -182,12 +185,17 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
             # 得到对应返回的字节串
             buf, _ = recvsock.recvfrom()
 
-            # 长度不足IPv4首部最短长度, 可能是截断包或异常短包，直接 IPv4(buf) 会越报错，直接丢弃并继续下一轮尝试。
+            # 长度不足IPv4首部最短长度, 可能是截断包或异常短包，直接 IPv4(buf) 会越界报错，直接丢弃并继续下一轮尝试。
             if len(buf) < 20:
                 continue
 
             # 得到外部 IPv4 字段
             outer_ip = IPv4(buf)
+
+            # 校验 IPv4 载荷合法性: fragment offset 若不为0, 则表示此字段经过分片, 不是完整字段
+            if outer_ip.version != 4 or outer_ip.frag_offset > 0:
+                continue
+
             icmp_offset = outer_ip.header_len       # icmp 偏移量, 对应于IPv4header长度
 
             # 外层 IPv4 的上层协议不是 ICMP（协议号不为 1），
@@ -203,16 +211,17 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
             inner_udp_offset = inner_ip_offset + inner_ip.header_len
 
             # 检查协议, 以及字节串长度, 协议为 17 代表内嵌协议为UDP
-            if inner_ip.proto != 17 or len(buf) < inner_ip_offset + 8:
+            if inner_ip.proto != 17 or len(buf) < inner_udp_offset + 8:
                 continue
 
             inner_udp = UDP(buf[inner_udp_offset:])
 
             # 确认这条 ICMP 报错是由我们发往目标 IP / 探测端口的 UDP 包触发的
-            if inner_ip.dst != ip or inner_udp.dst_port != TRACEROUTE_PORT_NUMBER:
+            if inner_ip.dst != ip or inner_udp.dst_port != (TRACEROUTE_PORT_NUMBER + port_offset):
                 continue
 
-            # Type 11 (Time Exceeded) 表示途经路由器；Type 3, Code 3 (Port Unreachable) 表示到达目标主机
+            # Type 11 (Time Exceeded) 超时, code == 0, 传输中超时；
+            # Type 3, Code 3 (Port Unreachable) 表示到达目标主机
             # 这是 UDP 常用的判定组合, 其余type不是 traceroute 探测期待的响应
             if icmp.type == 11 and icmp.code == 0:
                 if outer_ip.src not in routers_this_ttl:
@@ -224,6 +233,8 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
 
         util.print_result(routers_this_ttl, ttl)
         result.append(routers_this_ttl)
+
+        port_offset += 1
 
         if reached:
             break
