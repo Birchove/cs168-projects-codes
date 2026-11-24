@@ -4,7 +4,7 @@ import util
 # Technically IPv4 supports TTLs up to 255, but in practice this is excessive.
 # Most traceroute implementations cap at approximately 30.  The unit tests
 # assume you don't change this number.
-TRACEROUTE_MAX_TTL = 30
+TRACEROUTE_MAX_TTL = 40
 
 # Cisco seems to have standardized on UDP ports [33434, 33464] for traceroute.
 # While not a formal standard, it appears that some routers on the internet
@@ -165,18 +165,19 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
     # TODO Add your implementation
     result = []
     reached = False
-    port_offset = 0     # 为每个ttl分配一个port, 防止不同的ttl因为延迟返回, 导致 traceroute 错误
-                        # 不能直接用回程外层ipv4的ttl判断, 因为去程和回程的路由可能不同.
-                        # 但规定端口后, 可从udp字段中唯一确定是哪次 ttl
+    probe_id = 0        # 具体到每次探测, 每次probe使用独立端口
+    payload = b"Potato"
 
     for ttl in range(1, TRACEROUTE_MAX_TTL + 1):
         routers_this_ttl = []
 
         # 多次尝试
+        sendsock.set_ttl(ttl)
         for _ in range(PROBE_ATTEMPT_COUNT):
             #   send
-            sendsock.set_ttl(ttl)
-            sendsock.sendto("Potato".encode(), (ip, TRACEROUTE_PORT_NUMBER + port_offset))
+            probe_port = TRACEROUTE_PORT_NUMBER + probe_id
+            sendsock.sendto(payload, (ip, probe_port))
+            probe_id += 1
 
             # 判断有无返回信号
             if not recvsock.recv_select():
@@ -192,9 +193,12 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
             # 得到外部 IPv4 字段
             outer_ip = IPv4(buf)
 
-            # 校验 IPv4 载荷合法性: fragment offset 若不为0, 则表示此字段经过分片, 不是完整字段
-            if outer_ip.version != 4 or outer_ip.frag_offset > 0:
-                continue
+            # 校验 IPv4 载荷合法性: fragment offset 若不为0, 则代表本块不是首片分片, 不可能包含完整ip信息
+            if (outer_ip.version != 4 or
+                outer_ip.header_len < 20 or
+                outer_ip.header_len > len(buf) or
+                outer_ip.frag_offset > 0
+                ):      continue
 
             icmp_offset = outer_ip.header_len       # icmp 偏移量, 对应于IPv4header长度
 
@@ -206,7 +210,19 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
             icmp = ICMP(buf[icmp_offset:])
 
             inner_ip_offset = icmp_offset + 8       # 固定长度, icmp偏移量 + 8
-            inner_ip = IPv4(buf[inner_ip_offset:])
+
+            # 检查内层ip合法性
+            if len(buf) < inner_ip_offset + 20:
+                continue
+            inner_ip = IPv4(buf[inner_ip_offset:])  
+
+            # 内层 ipv4 合法性
+            if (
+                    inner_ip.version != 4
+                    or inner_ip.header_len < 20
+                    or inner_ip.frag_offset > 0
+                ):
+                    continue
 
             inner_udp_offset = inner_ip_offset + inner_ip.header_len
 
@@ -217,7 +233,7 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
             inner_udp = UDP(buf[inner_udp_offset:])
 
             # 确认这条 ICMP 报错是由我们发往目标 IP / 探测端口的 UDP 包触发的
-            if inner_ip.dst != ip or inner_udp.dst_port != (TRACEROUTE_PORT_NUMBER + port_offset):
+            if inner_ip.dst != ip or inner_udp.dst_port != probe_port:
                 continue
 
             # Type 11 (Time Exceeded) 超时, code == 0, 传输中超时；
@@ -229,15 +245,29 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
             elif icmp.type == 3 and icmp.code == 3:
                 if outer_ip.src not in routers_this_ttl:
                     routers_this_ttl.append(outer_ip.src)
-                reached = True
+
+                # 确定这个 不可达(type3 + code3) 的字段来自目标ip
+                if outer_ip.src == ip:
+                    reached = True
+
+        if reached:
+            # 如果到达目标地址, 就应只包含目标地址ip
+            routers_this_ttl = [ip]
 
         util.print_result(routers_this_ttl, ttl)
         result.append(routers_this_ttl)
-
-        port_offset += 1
+        print(
+            f"[DEBUG] TTL={ttl}, "
+            f"expected_port={probe_port}, "
+            f"router={outer_ip.src}, "
+            f"ICMP={icmp.type}/{icmp.code}, "
+            f"inner_dst={inner_ip.dst}, "
+            f"received_port={inner_udp.dst_port}"
+        )
 
         if reached:
             break
+
     return result
 
 
