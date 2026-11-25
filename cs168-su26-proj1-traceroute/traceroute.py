@@ -18,6 +18,14 @@ TRACEROUTE_PORT_NUMBER = 33434  # Cisco traceroute port number.
 # single router before giving up and moving on.
 PROBE_ATTEMPT_COUNT = 3
 
+ICMP_TIME_EXCEEDED = (11, 0)
+ICMP_PORT_UNREACHABLE = (3, 3)
+TRACEROUTE_PAYLOAD = b"Potato"
+
+# 避免达到65536端口, 采用取模运算
+PROBE_PORT_RANGE = 65536 - TRACEROUTE_PORT_NUMBER
+
+
 class IPv4:
     # Each member below is a field from the IPv4 packet header.  They are
     # listed below in the order they appear in the packet.  All fields should
@@ -37,7 +45,7 @@ class IPv4:
     src: str
     dst: str
 
-    def __init__(self, buffer: bytes):
+    def __init__(self, buffer: bytes | memoryview):
         # 本课程中统一采用大端序进行encode-decode
         # 大端序: 高位字节在前, 低位字节在后; 小端序反之
         # 字节序只会影响跨字节的 编码解析, 不会影响单字节解码
@@ -47,21 +55,27 @@ class IPv4:
         if len(view) < 20:
             raise ValueError("IPv4 header must be at least 20 bytes")
 
-        first_byte = buffer[0]      # First Byte: Version & IHL
+        first_byte = view[0]      # First Byte: Version & IHL
         self.version = first_byte >> 4 # higher 4 bits
         ihl = first_byte & 0x0F     # Internet Header Length, 报头长度, 以 4 byte为一个单位
         self.header_len = 4 * ihl   # 转为 byte 单位
 
+        if self.version != 4:
+            raise ValueError("Invalid IPv4 version")
+
         if self.header_len < 20 or len(view) < self.header_len:
             raise ValueError("Invalid IHL or truncated IPv4 header")
 
-        second_byte = buffer[1]     # Second Byte: DSCP & ECN
-        dscp = second_byte >> 2     # higher 6 bits, DSCP（Differentiated Services Code Point，差分服务代码点）
-        ecn = second_byte & 0x03    # ECN（Explicit Congestion Notification，显式拥塞通知）
-        self.tos = (dscp << 2) | ecn    # 此 Class 中没有分开定义两者, 为了匹配 Class, 所以再将二者拼起来
+        second_byte = view[1]     # Second Byte: DSCP & ECN
+        _dscp = second_byte >> 2     # higher 6 bits, DSCP（Differentiated Services Code Point，差分服务代码点）
+        _ecn = second_byte & 0x03    # ECN（Explicit Congestion Notification，显式拥塞通知）
+        self.tos = second_byte    # 此 Class 中没有分开定义两者, 为了匹配 Class, 所以再将二者拼起来
 
         total_length_bytes = view[2:4]  # 整个 IP 包理论字节数
         self.length = int.from_bytes(total_length_bytes, 'big')      # 将字节表示转为具体的int数字
+
+        if self.length < self.header_len:
+            raise ValueError("Invalid IPv4 total length")
 
         id_bytes = view[4:6]        # 分片重组标识
         self.id = int.from_bytes(id_bytes, 'big')
@@ -71,9 +85,9 @@ class IPv4:
         self.frag_offset = flags_frag & 0x1FFF      # 后13位, 指明当前分片所携带的数据（有效载荷）
         # 实际字节偏移量: offset * 8
 
-        self.ttl = buffer[8]        # TTL
+        self.ttl = view[8]        # TTL
 
-        self.proto = buffer[9]      # Protocol
+        self.proto = view[9]      # Protocol
 
         self.cksum = int.from_bytes(view[10:12], 'big') # header checksum
 
@@ -86,7 +100,7 @@ class IPv4:
     def __str__(self) -> str:
         return f"IPv{self.version} (tos 0x{self.tos:x}, ttl {self.ttl}, " + \
             f"id {self.id}, flags 0x{self.flags:x}, " + \
-            f"ofsset {self.frag_offset}, " + \
+            f"offset {self.frag_offset}, " + \
             f"proto {self.proto}, header_len {self.header_len}, " + \
             f"len {self.length}, cksum 0x{self.cksum:x}) " + \
             f"{self.src} > {self.dst}"
@@ -102,14 +116,18 @@ class ICMP:
     code: int
     cksum: int
 
-    def __init__(self, buffer: bytes):
-        self.type = buffer[0]   # 消息类型, 如11为TTL结束, 3为unreachable
-        self.code = buffer[1]   # 具体子原因；如 Type=11 且 Code=0 表示传输途中 TTL 超时，Type=3 且 Code=3 表示目的端口不可达
-
+    def __init__(self, buffer: bytes | memoryview):
         view = memoryview(buffer)
+
+        if len(view) < 8:
+            raise ValueError("ICMP header must be at least 8 bytes")
+        
+        self.type = view[0]   # 消息类型, 如11为TTL结束, 3为unreachable
+        self.code = view[1]   # 具体子原因；如 Type=11 且 Code=0 表示传输途中 TTL 超时，Type=3 且 Code=3 表示目的端口不可达
+
         self.cksum = int.from_bytes(view[2:4], 'big')  # 覆盖整个 ICMP 报文（含头部与载荷）的 16 位反码和校验
 
-        rest_of_header = int.from_bytes(view[4:8], 'big') # Rest of Header / Unused
+        _rest_of_header = int.from_bytes(view[4:8], 'big') # Rest of Header / Unused
 
 
     def __str__(self) -> str:
@@ -128,8 +146,11 @@ class UDP:
     len: int
     cksum: int
 
-    def __init__(self, buffer: bytes):
+    def __init__(self, buffer: bytes | memoryview):
         view = memoryview(buffer)
+
+        if len(view) < 8:
+            raise ValueError("UDP header must be at least 8 bytes")
 
         self.src_port = int.from_bytes(view[:2], 'big')     # 发送端端口
         self.dst_port = int.from_bytes(view[2:4], 'big')    # 接收端端口
@@ -141,6 +162,53 @@ class UDP:
             f"len {self.len}, cksum 0x{self.cksum:x})"
 
 # TODO feel free to add helper functions if you'd like
+
+# Helper1: 通用的 IPv4 解析函数
+def parse_ipv4_header(buffer: bytes | memoryview, offset: int, protocol: int | None = None) -> IPv4 | None:
+    view = memoryview(buffer)
+
+    # 数据本身的合法性
+    if offset < 0 or offset >= len(view):
+        return None
+
+    ################## IPv4 Header 结构合法性 ###################
+
+    # 利用构造函数排除不符合要求的情况, 是结构性的解析失败:
+    # 1. 长度不够20; 2. header-length >= 20 , header-length >= len(view)
+    # 3. version; 4. total length
+    try:
+        packet = IPv4(view[offset:])
+    except ValueError:
+        return None
+
+    # 补充特异场景下的需求
+    # 1. check the protocol
+    if protocol is not None and protocol != packet.proto:
+        return None
+
+    return packet
+    
+
+def parse_icmp(buffer: bytes | memoryview, offset: int) -> ICMP | None:
+    view = memoryview(buffer)
+    if offset < 0 or offset >= len(view):
+        return None
+    try:
+        packet = ICMP(view[offset:])
+    except ValueError:
+        return None
+    
+    return packet
+
+def parse_udp(buffer: bytes | memoryview, offset: int) -> UDP | None:
+    view = memoryview(buffer)
+    if offset < 0 or offset >= len(view):
+        return None
+    try:
+        packet = UDP(view[offset:])
+    except ValueError:
+        return None
+    return packet
 
 def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
         -> list[list[str]]:
@@ -166,104 +234,75 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
     result = []
     reached = False
     probe_id = 0        # 具体到每次探测, 每次probe使用独立端口
-    payload = b"Potato"
+    payload = TRACEROUTE_PAYLOAD
 
     for ttl in range(1, TRACEROUTE_MAX_TTL + 1):
-        routers_this_ttl = []
+        # 去除重复探测
+        routers_this_ttl = set()
 
         # 多次尝试
         sendsock.set_ttl(ttl)
         for _ in range(PROBE_ATTEMPT_COUNT):
             #   send
-            probe_port = TRACEROUTE_PORT_NUMBER + probe_id
+            probe_port = TRACEROUTE_PORT_NUMBER + probe_id % PROBE_PORT_RANGE   # 取模防止端口用尽
             sendsock.sendto(payload, (ip, probe_port))
             probe_id += 1
 
-            # 判断有无返回信号
-            if not recvsock.recv_select():
-                continue
-
-            # 得到对应返回的字节串
-            buf, _ = recvsock.recvfrom()
-
-            # 长度不足IPv4首部最短长度, 可能是截断包或异常短包，直接 IPv4(buf) 会越界报错，直接丢弃并继续下一轮尝试。
-            if len(buf) < 20:
-                continue
-
-            # 得到外部 IPv4 字段
-            outer_ip = IPv4(buf)
-
-            # 校验 IPv4 载荷合法性: fragment offset 若不为0, 则代表本块不是首片分片, 不可能包含完整ip信息
-            if (outer_ip.version != 4 or
-                outer_ip.header_len < 20 or
-                outer_ip.header_len > len(buf) or
-                outer_ip.frag_offset > 0
-                ):      continue
-
-            icmp_offset = outer_ip.header_len       # icmp 偏移量, 对应于IPv4header长度
-
-            # 外层 IPv4 的上层协议不是 ICMP（协议号不为 1），
-            # 或者剩余字节数不足以容纳一个完整的 8 字节 ICMP 首部 + 20 字节 内部IPv4 协议
-            if outer_ip.proto != 1 or len(buf) < icmp_offset + 8 + 20:
-                continue
-
-            icmp = ICMP(buf[icmp_offset:])
-
-            inner_ip_offset = icmp_offset + 8       # 固定长度, icmp偏移量 + 8
-
-            # 检查内层ip合法性
-            if len(buf) < inner_ip_offset + 20:
-                continue
-            inner_ip = IPv4(buf[inner_ip_offset:])  
-
-            # 内层 ipv4 合法性
-            if (
-                    inner_ip.version != 4
-                    or inner_ip.header_len < 20
-                    or inner_ip.frag_offset > 0
-                ):
+            while recvsock.recv_select():
+                buf, _ = recvsock.recvfrom()
+                # outer ipv4
+                outer_ip = parse_ipv4_header(buf, 0, 1)
+                if not outer_ip:
                     continue
 
-            inner_udp_offset = inner_ip_offset + inner_ip.header_len
+                # icmp
+                icmp_offset = outer_ip.header_len
+                icmp = parse_icmp(buf, icmp_offset)
+                if not icmp:
+                    continue
 
-            # 检查协议, 以及字节串长度, 协议为 17 代表内嵌协议为UDP
-            if inner_ip.proto != 17 or len(buf) < inner_udp_offset + 8:
-                continue
+                # inner ipv4
+                inner_ip_offset = icmp_offset + 8
+                inner_ip = parse_ipv4_header(buf, inner_ip_offset, 17)
+                if not inner_ip:
+                    continue
 
-            inner_udp = UDP(buf[inner_udp_offset:])
+                # inner udp
+                inner_udp_offset = inner_ip_offset + inner_ip.header_len
+                inner_udp = parse_udp(buf, inner_udp_offset)
+                if not inner_udp:
+                    continue
 
-            # 确认这条 ICMP 报错是由我们发往目标 IP / 探测端口的 UDP 包触发的
-            if inner_ip.dst != ip or inner_udp.dst_port != probe_port:
-                continue
+                # 不属于当前目的地, 或者不是本次probe返回的结果:
+                if inner_ip.dst != ip or inner_udp.dst_port != probe_port:
+                    continue
 
-            # Type 11 (Time Exceeded) 超时, code == 0, 传输中超时；
-            # Type 3, Code 3 (Port Unreachable) 表示到达目标主机
-            # 这是 UDP 常用的判定组合, 其余type不是 traceroute 探测期待的响应
-            if icmp.type == 11 and icmp.code == 0:
-                if outer_ip.src not in routers_this_ttl:
-                    routers_this_ttl.append(outer_ip.src)
-            elif icmp.type == 3 and icmp.code == 3:
-                if outer_ip.src not in routers_this_ttl:
-                    routers_this_ttl.append(outer_ip.src)
+                status = (icmp.type, icmp.code)
+                if status == ICMP_TIME_EXCEEDED:
+                    routers_this_ttl.add(outer_ip.src)
+                    break
+                elif status == ICMP_PORT_UNREACHABLE:
+                    # 非目标的3, 3: 不加入路由表
+                    if outer_ip.src == ip:
+                        routers_this_ttl.add(ip)
+                        reached = True
+                    # 无论是否目标，都结束本次探测等待
+                    break
+                # 其他 ICMP 类型：continue 继续等待，不 break
 
-                # 确定这个 不可达(type3 + code3) 的字段来自目标ip
-                if outer_ip.src == ip:
-                    reached = True
+            # 避免无意义等待
+            if reached:
+                break
 
+        routers_this_ttl = list(routers_this_ttl)
+
+        # 如果到达目标主机, 将其移到最后一次响应
+        routers_this_ttl = [r for r in routers_this_ttl if r != ip]
         if reached:
-            # 如果到达目标地址, 就应只包含目标地址ip
-            routers_this_ttl = [ip]
+            routers_this_ttl.append(ip)
 
         util.print_result(routers_this_ttl, ttl)
         result.append(routers_this_ttl)
-        print(
-            f"[DEBUG] TTL={ttl}, "
-            f"expected_port={probe_port}, "
-            f"router={outer_ip.src}, "
-            f"ICMP={icmp.type}/{icmp.code}, "
-            f"inner_dst={inner_ip.dst}, "
-            f"received_port={inner_udp.dst_port}"
-        )
 
         if reached:
             break
